@@ -54,7 +54,7 @@ To run the Biterate project locally, follow these steps:
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/biterate.git
+   git clone https://github.com/vishwaswarup/BiteRate
    cd biterate
    ```
 
