@@ -10,9 +10,9 @@ df = pd.read_csv("Restaurant_Reviews.tsv", delimiter="\t", quoting=3)
 df['cleaned'] = df['Review'].apply(clean_text)
 
 # --- Train & Evaluate ---
-vectorizer, models = train_and_evaluate(df)
+vectorizer, models, best_model_name = train_and_evaluate(df)
 
-best_model = models['Naive Bayes']
+best_model = models[best_model_name]
 
 with open('vectorizer.pkl', 'wb') as f:
     pickle.dump(vectorizer, f)
