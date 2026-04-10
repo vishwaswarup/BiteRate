@@ -1,14 +1,20 @@
 import re
+import os
 import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
 from nltk.stem import WordNetLemmatizer
 
-# --- NLTK setup ---
-nltk.download('punkt')
-nltk.download('punkt_tab')
-nltk.download('stopwords')
-nltk.download('wordnet')
+# --- NLTK setup (Vercel-compatible: write to /tmp) ---
+_nltk_data_dir = os.path.join("/tmp", "nltk_data")
+os.makedirs(_nltk_data_dir, exist_ok=True)
+nltk.data.path.insert(0, _nltk_data_dir)
+
+for _pkg in ("punkt", "punkt_tab", "stopwords", "wordnet"):
+    try:
+        nltk.download(_pkg, download_dir=_nltk_data_dir, quiet=True)
+    except Exception:
+        pass  # Already downloaded or offline — fail gracefully
+
+from nltk.corpus import stopwords
 
 stop_words = set(stopwords.words('english'))
 lemmatizer = WordNetLemmatizer()
