@@ -151,6 +151,12 @@ def index():
     return render_template("index.html", reviews=SAMPLE_REVIEWS, model_info=MODEL_INFO)
 
 
+@app.route("/favicon.ico")
+def favicon():
+    # Browsers request this path directly; serve the SVG mark instead of a 404.
+    return app.send_static_file("favicon.svg")
+
+
 @app.route("/predict", methods=["POST"])
 def predict():
     if pipeline is None:
