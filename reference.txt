@@ -1,0 +1,307 @@
+I recently found myself scrolling through restaurant reviews, trying to figure out if a place was worth visiting. The problem? There were hundreds of reviews, and I couldn’t tell if the complaints were about the food, service, or just bad luck. That’s when I realized: what if I could build something that actually understands what customers are saying?
+
+So I did. And along the way, I discovered LangChain’s Expression Language (LCEL), which completely changed how I think about building AI applications.
+
+Check out the code: github.com/JaimeLucena/google-reviews-sentiment
+
+The Problem with Traditional Sentiment Analysis
+Most sentiment analysis tools are pretty basic. They’ll tell you if something is “positive” or “negative,” but that’s not really useful. When a customer says “The food was amazing but the service was terrible,” you need to know:
+
+What aspects they’re talking about (food vs. service)
+How strongly they feel about each one
+Why they feel that way
+That’s where modern LLMs shine. Instead of training a model on a specific dataset, you can use GPT models that already understand language nuances, sarcasm, and context. They can extract structured information automatically, without any training.
+
+Discovering LangChain LCEL
+When I started building this, I was doing things the old-fashioned way:
+
+def analyze_sentiment(text):
+    cleaned = clean_text(text)
+    prompt = build_prompt(cleaned)
+    response = llm.invoke(prompt)
+    result = parse_response(response)
+    return result
+It worked, but it was messy. Then I discovered LCEL, and everything clicked.
+
+LCEL (LangChain Expression Language) lets you compose AI workflows using Python’s pipe operator (|). It's like Unix pipes, but for AI. Instead of nested function calls, you write:
+
+chain = preprocess | prompt | llm | parser
+result = await chain.ainvoke({"text": text})
+This might seem like a small change, but it makes your code:
+
+Easier to read: The flow is obvious
+Easier to modify: Swap components in and out
+Easier to test: Each piece is independent
+Faster: Built-in async support and batch processing
+How the System Works
+Here’s what happens when someone asks to analyze reviews for a business:
+
+Step 1: Finding the Business
+The user provides a query like “Joe’s Pizza in New York.” We use Google Places API to convert this into a place_id—a stable identifier that doesn't change.
+
+Step 2: Fetching Reviews
+Once we have the place ID, we pull reviews from Google. Each review contains text, author, rating, and timestamp. We extract just the text for analysis.
+
+Step 3: Processing Through the Chain
+This is where LCEL shines. Each review goes through our chain:
+
+Preprocessing: Clean up whitespace and encoding issues
+Prompt Building: Create a structured prompt with instructions
+LLM Processing: Send to OpenAI GPT for analysis
+Parsing: Validate and structure the response
+Step 4: Aggregating Results
+Multiple reviews are processed in parallel (thanks to abatch()), and we return structured data with sentiment scores, aspects, and explanations.
+
+Building the Core Chain
+The heart of the application lives in app/chains.py. Here's how I built it:
+
+def build_sentiment_chain(model_name: str | None = None):
+    """
+    LCEL chain: (preprocess) -> prompt -> llm -> Pydantic parser
+    """
+    # Step 1: Create a Pydantic output parser
+    parser = PydanticOutputParser(pydantic_object=ReviewSentiment)
+
+    # Step 2: Define the system prompt
+    system = (
+        "You are a precise sentiment analyst. "
+        "Return a single JSON object strictly matching the given schema.\n"
+        "{format_instructions}\n"
+        "Scoring: negative=-1..-0.05, neutral≈-0.05..0.05, positive=0.05..1.0.\n"
+        "Keep rationale concise. Extract aspects if present; otherwise return an empty list."
+    )
+    # Step 3: Create the prompt template
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system),
+        ("user", "Analyze the sentiment of the following review.\n"
+                 "Language hint: {language_hint}\n"
+                 "Text: ```
+{text}
+```"),
+    ])
+    # Step 4: Initialize the LLM
+    llm = build_llm(model_name)
+    # Step 5: Preprocessing step
+    pre = RunnableLambda(
+        lambda x: {
+            "text": normalize_text(x["text"]),
+            "language_hint": x.get("language_hint"),
+            "format_instructions": parser.get_format_instructions(),
+        }
+    )
+    # Step 6: Compose the chain using the pipe operator
+    chain = pre | prompt | llm | parser
+    return chain
+Let me break down what each piece does:
+
+RunnableLambda: Your Custom Logic
+RunnableLambda wraps any Python function to make it part of the chain. I use it for preprocessing:
+
+pre = RunnableLambda(
+    lambda x: {
+        "text": normalize_text(x["text"]),
+        "language_hint": x.get("language_hint"),
+        "format_instructions": parser.get_format_instructions(),
+    }
+)
+This cleans up the text and injects format instructions before the prompt is built. It’s perfect for transformations that don’t need an LLM.
+
+ChatPromptTemplate: Structured Conversations
+The prompt template separates system instructions from user input:
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", system),
+    ("user", "Analyze the sentiment..."),
+])
+This is crucial because:
+
+System messages set the context and role
+User messages contain the actual data
+The template handles variable substitution automatically
+It works with any chat model (OpenAI, Anthropic, etc.)
+The LLM Call
+When the chain runs, the prompt is rendered with actual values, formatted for the model, and sent to OpenAI. The response comes back as an AIMessage object.
+
+Get Jaime Lucena Pérez’s stories in your inbox
+Join Medium for free to get updates from this writer.
+
+Enter your email
+Subscribe
+
+Remember me for faster sign in
+
+I’m using gpt-4o-mini because it's fast, cost-effective, and perfect for sentiment analysis. For more complex reasoning, you might want gpt-4o, but for this use case, the mini version works great.
+
+PydanticOutputParser: Type Safety
+This is where the magic happens. The parser:
+
+Extracts text from the LLM response
+Parses the JSON
+Validates against your Pydantic model
+Returns a typed Python object
+If the JSON is malformed or validation fails, it raises an error you can catch and handle. This ensures you always get data in the expected format.
+
+Why Pydantic Models Matter
+I use Pydantic models to define the structure of my data:
+
+class SentimentLabel(str, Enum):
+    positive = "positive"
+    neutral = "neutral"
+    negative = "negative"
+
+class AspectSentiment(BaseModel):
+    aspect: str = Field(..., description="The aspect/topic mentioned")
+    label: SentimentLabel
+    score: float = Field(..., ge=-1.0, le=1.0)
+class ReviewSentiment(BaseModel):
+    text: str
+    language: Optional[str] = None
+    label: SentimentLabel
+    score: float = Field(..., ge=-1.0, le=1.0)
+    rationale: str = Field(..., description="Short explanation")
+    aspects: List[AspectSentiment] = Field(default_factory=list)
+Pydantic gives you:
+
+Automatic validation: Invalid data is caught immediately
+Type hints: Your IDE knows what to expect
+JSON schema generation: The parser uses this to tell the LLM what format to return
+Guaranteed structure: You always get data in the expected shape
+The PydanticOutputParser automatically generates format instructions from your model and includes them in the prompt. The LLM sees exactly what JSON structure to return, which dramatically improves reliability.
+
+Processing Multiple Reviews Efficiently
+One of the best things about LCEL is how easy it makes batch processing:
+
+async def analyze_texts(payload: AnalyzeTextRequest) -> List[ReviewSentiment]:
+    chain = build_sentiment_chain(payload.model_name)
+    inputs = [
+        {"text": t, "language_hint": payload.language_hint} 
+        for t in payload.texts
+    ]
+    # Process all reviews in parallel!
+    results: List[ReviewSentiment] = await chain.abatch(inputs)
+    return results
+The abatch() method handles:
+
+Parallel execution: All reviews processed simultaneously
+Rate limiting: Respects API limits automatically
+Error handling: Individual failures don’t stop the batch
+Progress tracking: You can monitor what’s happening
+This is way better than processing sequentially. Instead of waiting for each review to finish before starting the next, everything runs in parallel.
+
+The Art of Prompt Engineering
+Getting good results from LLMs is all about prompt design. Here’s what I learned:
+
+System Message Strategy
+The system message sets the context. I tell the model:
+
+"You are a precise sentiment analyst. "
+"Return a single JSON object strictly matching the given schema.\n"
+"{format_instructions}\n"
+"Scoring: negative=-1..-0.05, neutral≈-0.05..0.05, positive=0.05..1.0.\n"
+"Keep rationale concise. Extract aspects if present; otherwise return an empty list."
+Key elements:
+
+Role definition: “You are a precise sentiment analyst” — this helps the model adopt the right persona
+Format requirements: Explicitly state what format to return
+Scoring guidelines: Clear ranges prevent ambiguous scores
+Output guidelines: Tell the model when to extract aspects and how long explanations should be
+User Message Design
+The user message is simple and direct:
+
+"Analyze the sentiment of the following review.\n"
+"Language hint: {language_hint}\n"
+"Text: ```
+
+{text}
+
+```"
+I use triple backticks to clearly mark the text, and include a language hint for multilingual reviews. The simpler, the better — no ambiguity.
+
+Format Instructions
+The PydanticOutputParser automatically generates detailed format instructions that look like:
+
+The output should be formatted as a JSON instance that conforms to the JSON schema below.
+
+Schema:
+{
+  "properties": {
+    "text": {"title": "Text", "type": "string"},
+    "label": {"title": "Label", "enum": ["positive", "neutral", "negative"]},
+    "score": {"title": "Score", "type": "number", "minimum": -1.0, "maximum": 1.0},
+    ...
+  },
+  "required": ["text", "label", "score", "rationale", "aspects"]
+}
+This ensures the LLM knows exactly what to return, which dramatically improves reliability.
+
+Making It Fast: Async and Batch Processing
+When I first built this, I was processing reviews one at a time. That was slow. Then I discovered the power of async/await and batch processing.
+
+The old way (slow):
+
+result1 = analyze(text1)  # Wait 2 seconds
+result2 = analyze(text2)  # Wait 2 seconds
+# Total: 4 seconds
+The new way (fast):
+
+results = await asyncio.gather(
+    analyze(text1),  # Start immediately
+    analyze(text2)   # Start immediately
+)
+# Total: ~2 seconds (parallel)
+LCEL chains are async by default, so you get this for free. Use ainvoke() for single items and abatch() for multiple items.
+
+Cost Optimization Tips
+Running LLM applications can get expensive. Here’s what I learned:
+
+Token usage breakdown:
+
+System prompt: ~100 tokens (sent once per request)
+User prompt: ~50–200 tokens per review
+Response: ~100–300 tokens per review
+Ways to save money:
+
+Batch processing: Reduces overhead by processing multiple items together
+Model selection: gpt-4o-mini is 10x cheaper than gpt-4o and works great for sentiment analysis
+Prompt optimization: Shorter prompts = lower costs
+Caching: Cache results for identical reviews to avoid redundant API calls
+What I Learned
+Building this project taught me several important lessons:
+
+1. LCEL makes code more maintainable
+The pipe operator (|) creates a clear flow that's easy to understand and modify. Each component is independent, making testing and debugging much easier.
+
+2. Structured outputs are essential
+Using Pydantic models with PydanticOutputParser ensures you always get data in the expected format. This eliminates a huge class of bugs.
+
+3. Async/await is your friend
+Modern AI applications need to handle multiple requests efficiently. LCEL’s built-in async support makes this natural.
+
+4. Prompt engineering matters
+Small changes to prompts can dramatically affect output quality. Spend time refining your prompts — it’s worth it.
+
+5. Error handling is crucial
+APIs fail. Networks timeout. Always handle errors gracefully and provide meaningful feedback to users.
+
+The Architecture That Makes It Work
+The system is built with clear separation of concerns:
+
+Google Places client: Handles external API calls
+LCEL chain: Manages AI processing
+FastAPI: Handles HTTP requests and responses
+Pydantic: Ensures data validation at every step
+This modular approach makes the codebase easy to understand, test, and extend. Each piece has a single responsibility, which makes debugging much easier.
+
+Wrapping Up
+This project demonstrates real-world patterns you’ll use in production AI applications. The combination of LCEL, Pydantic, and async/await creates a robust foundation for any LLM-powered service.
+
+If you’re learning generative AI, I highly recommend:
+
+Experimenting with different prompts to see how they affect output
+Trying different LLM models to understand their strengths
+Building your own features on top of this foundation
+Deploying to production to see how it performs under load
+The code is available on GitHub with full installation instructions and examples. Feel free to fork it, modify it, and make it your own.
+
+Building AI applications doesn’t have to be complicated. With tools like LangChain LCEL, you can create powerful systems that are also maintainable and easy to understand. That’s the real win.
+

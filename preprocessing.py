@@ -3,20 +3,32 @@ import os
 import nltk
 from nltk.stem import WordNetLemmatizer
 
-# --- NLTK setup (Vercel-compatible: write to /tmp) ---
-_nltk_data_dir = os.path.join("/tmp", "nltk_data")
-os.makedirs(_nltk_data_dir, exist_ok=True)
+# --- NLTK setup: data is bundled in ./nltk_data so no network is needed at runtime ---
+_nltk_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nltk_data")
 nltk.data.path.insert(0, _nltk_data_dir)
 
-for _pkg in ("punkt", "punkt_tab", "stopwords", "wordnet"):
-    try:
+def _has_nltk_resource(pkg):
+    # NLTK finds unzipped data as corpora/<pkg> and bundled archives as corpora/<pkg>.zip/<pkg>/
+    for path in (f"corpora/{pkg}", f"corpora/{pkg}.zip/{pkg}/"):
+        try:
+            nltk.data.find(path)
+            return True
+        except LookupError:
+            pass
+    return False
+
+
+for _pkg in ("stopwords", "wordnet"):
+    if not _has_nltk_resource(_pkg):
         nltk.download(_pkg, download_dir=_nltk_data_dir, quiet=True)
-    except Exception:
-        pass  # Already downloaded or offline — fail gracefully
 
 from nltk.corpus import stopwords
 
-stop_words = set(stopwords.words('english'))
+# Words that carry sentiment and must survive stopword removal.
+NEGATIONS = {"not", "no", "nor", "never", "none", "nothing", "neither", "without", "hardly", "barely"}
+KEEP = NEGATIONS | {"very", "too", "only", "most", "more", "few", "against", "off", "just", "so", "really"}
+
+stop_words = set(stopwords.words("english")) - KEEP
 lemmatizer = WordNetLemmatizer()
 
 # Emoji pattern - covers most common emoji ranges
@@ -31,61 +43,48 @@ EMOJI_PATTERN = re.compile(
     "\U0001F900-\U0001F9FF"  # Supplemental Symbols and Pictographs
     "\U0001FA00-\U0001FA6F"  # Chess Symbols
     "\U0001FA70-\U0001FAFF"  # Symbols and Pictographs Extended-A
-    "\U00002702-\U000027B0"  # Dingbats
-    "\U000024C2-\U0001F251"  # Enclosed characters
+    "\U00002600-\U000027BF"  # Misc symbols & dingbats
     "]+"
 )
 
+NEGATION_SCOPE = 2  # how many following words a negation applies to
+_CLAUSE_BREAK = re.compile(r"[.!?,;:\n]|\bbut\b|\bhowever\b")
+
+
+def _expand_contractions(text):
+    text = text.replace("’", "'").replace("‘", "'").replace("`", "'")
+    text = re.sub(r"\bwon't\b", "will not", text)
+    text = re.sub(r"\bcan't\b|\bcannot\b", "can not", text)
+    text = re.sub(r"n't\b", " not", text)  # don't, wasn't, isn't, ...
+    return text
+
+
+def _mark_clause(clause):
+    """Lemmatize a clause and prefix words in negation scope with not_."""
+    clause = EMOJI_PATTERN.sub(lambda m: " " + " ".join(m.group()) + " ", clause)  # one token per emoji
+    out, scope = [], 0
+    for word in clause.split():
+        if EMOJI_PATTERN.fullmatch(word):
+            out.append(word)
+        elif word in NEGATIONS:
+            scope = NEGATION_SCOPE
+        elif word.isalpha() and (word not in stop_words) and len(word) > 1:
+            word = lemmatizer.lemmatize(word)
+            if scope:
+                out.append(f"not_{word}")
+                scope -= 1
+            else:
+                out.append(word)
+    return out
+
+
 # --- Step 2: Preprocessing ---
 def clean_text(text):
-    # Step 1: Replace common negations
-    text = re.sub(r"n't", ' not', text)  # e.g., don't → do not
-    
-    # Step 2: Convert to lowercase (emojis are case-insensitive)
-    text = text.lower()
-    
-    # Step 3: Add spaces around emojis so they become separate tokens
-    text = EMOJI_PATTERN.sub(lambda m: f' {m.group()} ', text)
-    
-    # Step 4: Remove digits and punctuation but keep letters, spaces, and emojis
-    # Instead of removing emojis, we'll rebuild the string keeping only valid chars
-    cleaned_chars = []
-    for char in text:
-        if char.isalpha() or char.isspace():
-            # Keep letters and spaces
-            cleaned_chars.append(char)
-        elif EMOJI_PATTERN.match(char):
-            # Keep emojis
-            cleaned_chars.append(char)
-        else:
-            # Replace other characters with space
-            cleaned_chars.append(' ')
-    text = ''.join(cleaned_chars)
-    
-    # Step 5: Tokenize - split on whitespace to preserve emojis
-    tokens = text.split()
-    
-    # Step 6: Process tokens: separate regular words from emojis
-    processed_tokens = []
-    for word in tokens:
-        if EMOJI_PATTERN.match(word):
-            # Keep emoji as-is
-            processed_tokens.append(word)
-        elif word not in stop_words and word.isalpha():
-            # Lemmatize regular words only
-            processed_tokens.append(lemmatizer.lemmatize(word))
-    
-    # Step 7: Merge negation + next word
-    final_tokens = []
-    skip_next = False
-    for i, word in enumerate(processed_tokens):
-        if skip_next:
-            skip_next = False
-            continue
-        if word == 'not' and i+1 < len(processed_tokens) and not EMOJI_PATTERN.match(processed_tokens[i+1]):
-            final_tokens.append(f'not_{processed_tokens[i+1]}')
-            skip_next = True
-        else:
-            final_tokens.append(word)
-    
-    return ' '.join(final_tokens)
+    text = _expand_contractions(str(text).lower())
+    # Keep punctuation until clauses are split so negation does not leak across them.
+    pieces = re.split(r"(?:[.!?,;:\n]+|\bbut\b|\bhowever\b)", text)
+    tokens = []
+    for piece in pieces:
+        piece = "".join(c if (c.isalpha() or c.isspace() or EMOJI_PATTERN.fullmatch(c)) else " " for c in piece)
+        tokens.extend(_mark_clause(piece))
+    return " ".join(tokens)

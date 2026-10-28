@@ -9,4 +9,3 @@ env/
 dist/
 build/
 .DS_Store
-nltk_data/

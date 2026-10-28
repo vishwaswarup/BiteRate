@@ -1,392 +1,295 @@
 /* ===========================================================================
-   BiteRate — Dashboard JavaScript
+   BiteRate
+   User-supplied text is only ever inserted with textContent / text nodes.
    =========================================================================== */
 
-// Track the next review ID for dynamically added rows
-let nextReviewId = 13;
+const CLASSES = ["Positive", "Neutral", "Negative"];
+const MAX_CHARS = 5000;
+const BATCH_CHUNK = 100; // server limit per /predict_all request
+
+const EXAMPLES = [
+    "Hands down the best tacos in the city. The salsa verde is addictive and the staff were lovely. Five stars!",
+    "The ambiance was nice and the dessert was excellent, but the mains were bland and we waited forty minutes for a table.",
+    "I wouldn't say the food was bad, but it definitely wasn't worth the price. Not coming back.",
+];
+
+const $ = (id) => document.getElementById(id);
+const state = { items: [], nextId: 1, filter: "all", query: "", last: null };
 
 document.addEventListener("DOMContentLoaded", () => {
-    initTooltips();
-    initClock();
-    initSearch();
-    initFilter();
-    initPredictAll();
-    initAddReview();
-    updateSummaryCards(false); // initial count (no animation)
-
-    // Set nextReviewId based on existing rows
-    const existingRows = document.querySelectorAll("#reviewTableBody .review-row");
-    if (existingRows.length > 0) {
-        const ids = Array.from(existingRows).map(r => parseInt(r.getAttribute("data-id")) || 0);
-        nextReviewId = Math.max(...ids) + 1;
-    }
+    initAnalyzer();
+    initBatch();
 });
 
-/* -----------------------------------------------------------------------
-   Bootstrap Tooltips
-   ----------------------------------------------------------------------- */
-function initTooltips() {
-    const tooltipEls = document.querySelectorAll('[data-bs-toggle="tooltip"]');
-    tooltipEls.forEach(el => new bootstrap.Tooltip(el));
+/* ---------- helpers ---------- */
+function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
 }
 
-/* -----------------------------------------------------------------------
-   Live Clock
-   ----------------------------------------------------------------------- */
-function initClock() {
-    const el = document.getElementById("liveClock");
-    function tick() {
-        const now = new Date();
-        el.textContent = now.toLocaleTimeString("en-GB", {
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit",
-        });
-    }
-    tick();
-    setInterval(tick, 1000);
-}
-
-/* -----------------------------------------------------------------------
-   Summary Cards — count-up animation
-   ----------------------------------------------------------------------- */
-function updateSummaryCards(animate = true) {
-    const rows = document.querySelectorAll("#reviewTableBody .review-row");
-    let total = rows.length;
-    let pos = 0, neg = 0, neu = 0;
-
-    rows.forEach(row => {
-        const s = row.getAttribute("data-sentiment");
-        if (s === "Positive") pos++;
-        else if (s === "Negative") neg++;
-        else if (s === "Neutral") neu++;
+async function postJson(url, body) {
+    const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
     });
-
-    if (animate) {
-        animateCount("totalCount", total);
-        animateCount("positiveCount", pos);
-        animateCount("negativeCount", neg);
-        animateCount("neutralCount", neu);
-    } else {
-        document.getElementById("totalCount").textContent = total;
-        document.getElementById("positiveCount").textContent = pos;
-        document.getElementById("negativeCount").textContent = neg;
-        document.getElementById("neutralCount").textContent = neu;
-    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+    return data;
 }
 
-function animateCount(elementId, target) {
-    const el = document.getElementById(elementId);
-    const current = parseInt(el.textContent) || 0;
-    if (current === target) return;
-
-    const duration = 400; // ms
-    const startTime = performance.now();
-
-    function step(now) {
-        const progress = Math.min((now - startTime) / duration, 1);
-        const eased = 1 - Math.pow(1 - progress, 3); // ease-out cubic
-        el.textContent = Math.round(current + (target - current) * eased);
-        if (progress < 1) requestAnimationFrame(step);
-    }
-    requestAnimationFrame(step);
-}
-
-/* -----------------------------------------------------------------------
-   Per-row Predict
-   ----------------------------------------------------------------------- */
-async function predictSingle(btnEl, reviewId) {
-    const row = btnEl.closest(".review-row");
-    const reviewText = row.querySelector(".review-full-text").value;
-
-    // Show spinner
-    btnEl.disabled = true;
-    btnEl.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
-
+async function withLoading(btn, fn) {
+    btn.disabled = true;
+    btn.classList.add("is-loading");
     try {
-        const res = await fetch("/predict", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ review: reviewText }),
-        });
-        const data = await res.json();
-        applyPrediction(row, data.sentiment, data.confidence);
+        return await fn();
+    } finally {
+        btn.disabled = false;
+        btn.classList.remove("is-loading");
+    }
+}
+
+let toastTimer;
+function toast(message) {
+    const node = $("toast");
+    node.textContent = message;
+    node.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => (node.hidden = true), 2800);
+}
+
+const fmt = (n) => n.toLocaleString("en-US");
+const plural = (n, word) => `${fmt(n)} ${word}${n === 1 ? "" : "s"}`;
+
+function sentimentTag(sentiment) {
+    const tag = el("span", `sent sent-${sentiment.toLowerCase()}`);
+    tag.append(el("i", "dot"), document.createTextNode(sentiment));
+    return tag;
+}
+
+function renderStack(container, values) {
+    container.replaceChildren();
+    const total = CLASSES.reduce((sum, c) => sum + (values[c] || 0), 0);
+    container.setAttribute("aria-label",
+        CLASSES.map((c) => `${c} ${total ? Math.round(((values[c] || 0) / total) * 100) : 0}%`).join(", "));
+    const segs = CLASSES.filter((c) => values[c]).map((c) => {
+        const seg = el("div", `stack-seg ${c.toLowerCase()}`);
+        seg.style.flexGrow = "0";
+        container.append(seg);
+        return [seg, values[c]];
+    });
+    void container.offsetWidth; // commit the zero widths so the grow transition runs
+    segs.forEach(([seg, v]) => (seg.style.flexGrow = v));
+}
+
+/* ---------- analyzer ---------- */
+function initAnalyzer() {
+    const input = $("analyzerInput");
+    // Only surface the counter when the limit is close; otherwise it is noise.
+    const count = () => {
+        const n = input.value.length;
+        $("charCount").textContent = n > MAX_CHARS * 0.9 ? `${fmt(n)} / ${fmt(MAX_CHARS)}` : "";
+    };
+    input.addEventListener("input", count);
+    input.addEventListener("keydown", (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === "Enter") analyze();
+    });
+    document.querySelectorAll("[data-example]").forEach((btn) =>
+        btn.addEventListener("click", () => {
+            input.value = EXAMPLES[Number(btn.dataset.example)];
+            count();
+            analyze();
+        })
+    );
+    $("analyzeBtn").addEventListener("click", analyze);
+    $("addToBatchBtn").addEventListener("click", () => {
+        if (!state.last) return;
+        addItems([state.last]);
+        $("addToBatchBtn").disabled = true;
+        toast("Added to batch");
+    });
+}
+
+async function analyze() {
+    const input = $("analyzerInput");
+    const text = input.value.trim();
+    if (!text) {
+        input.focus();
+        return toast("Type or paste a review first");
+    }
+    try {
+        const result = await withLoading($("analyzeBtn"), () => postJson("/predict", { review: text }));
+        state.last = { text, result };
+        renderResult(text, result);
+        $("addToBatchBtn").disabled = false;
     } catch (err) {
-        console.error("Prediction error:", err);
-        btnEl.innerHTML = "Retry";
-        btnEl.disabled = false;
+        toast(err.message);
     }
 }
 
-function applyPrediction(row, sentiment, confidence) {
-    // Update data attribute
-    row.setAttribute("data-sentiment", sentiment);
+function renderResult(text, result) {
+    $("analyzerResult").hidden = false;
 
-    // Sentiment badge
-    const sentCell = row.querySelector(".col-sentiment");
-    const badgeClass = sentiment === "Positive" ? "badge-positive"
-                     : sentiment === "Negative" ? "badge-negative"
-                     : "badge-neutral";
-    const label = sentiment === "Positive" ? "🟢 Positive"
-                : sentiment === "Negative" ? "🔴 Negative"
-                : "⚪ Neutral";
-    sentCell.innerHTML = `<span class="badge ${badgeClass}">${label}</span>`;
+    const label = $("verdictLabel");
+    label.textContent = result.sentiment;
+    label.className = `verdict-label is-${result.sentiment.toLowerCase()}`;
+    $("verdictConf").textContent = `${Math.round(result.confidence)}%`;
 
-    // Confidence bar
-    const confCell = row.querySelector(".col-confidence");
-    const fillClass = sentiment === "Positive" ? "fill-positive"
-                    : sentiment === "Negative" ? "fill-negative"
-                    : "fill-neutral";
-    confCell.innerHTML = `
-        <div class="confidence-bar-wrapper">
-            <div class="confidence-track">
-                <div class="confidence-fill ${fillClass}" style="width: 0"></div>
-            </div>
-            <span class="confidence-pct">${confidence}%</span>
-        </div>`;
-    // Animate bar after a frame
-    requestAnimationFrame(() => {
-        const fill = confCell.querySelector(".confidence-fill");
-        fill.style.width = confidence + "%";
+    renderStack($("probBar"), result.probabilities);
+    const legend = $("probLegend");
+    legend.replaceChildren();
+    CLASSES.forEach((c) => {
+        const li = el("li");
+        li.append(el("i", `dot ${c.toLowerCase()}`), document.createTextNode(c), el("span", "num", `${Math.round(result.probabilities[c])}%`));
+        legend.append(li);
     });
 
-    // Button → done
-    const btn = row.querySelector(".col-action .btn-predict, .col-action button");
-    btn.innerHTML = "✅";
-    btn.classList.add("btn-done");
-    btn.disabled = true;
-
-    // Update cards
-    updateSummaryCards(true);
+    renderHighlighted($("highlighted"), text, result.highlights || []);
 }
 
-/* -----------------------------------------------------------------------
-   Predict All
-   ----------------------------------------------------------------------- */
-function initPredictAll() {
-    const btn = document.getElementById("predictAllBtn");
-    btn.addEventListener("click", predictAll);
+function renderHighlighted(container, text, highlights) {
+    container.replaceChildren();
+    let cursor = 0;
+    highlights.forEach((h) => {
+        if (h.start < cursor) return;
+        container.append(document.createTextNode(text.slice(cursor, h.start)));
+        const mark = el("mark", `${h.polarity}${h.strength >= 0.5 ? " strong" : ""}`, text.slice(h.start, h.end));
+        mark.title = `${h.polarity === "pos" ? "Positive" : "Negative"} signal`;
+        container.append(mark);
+        cursor = h.end;
+    });
+    container.append(document.createTextNode(text.slice(cursor)));
 }
 
-async function predictAll() {
-    const btn = document.getElementById("predictAllBtn");
-    const labelSpan = btn.querySelector(".btn-label");
-    const spinnerSpan = btn.querySelector(".spinner-border");
+/* ---------- batch ---------- */
+function initBatch() {
+    const input = $("batchInput");
+    const lines = () => input.value.split("\n").map((l) => l.trim()).filter(Boolean);
+    const count = () => ($("lineCount").textContent = plural(lines().length, "review"));
+    input.addEventListener("input", count);
 
-    // Collect all review texts
-    const rows = Array.from(document.querySelectorAll("#reviewTableBody .review-row"));
-    const texts = rows.map(r => r.querySelector(".review-full-text").value);
-
-    // Disable button, show spinner
-    btn.disabled = true;
-    labelSpan.classList.add("d-none");
-    spinnerSpan.classList.remove("d-none");
-
-    // Disable all per-row buttons
-    rows.forEach(r => {
-        const b = r.querySelector(".col-action button");
-        if (b && !b.classList.contains("btn-done")) b.disabled = true;
+    $("loadSamplesBtn").addEventListener("click", () => {
+        input.value = JSON.parse($("sampleReviews").textContent).join("\n");
+        count();
     });
 
-    try {
-        const res = await fetch("/predict_all", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ reviews: texts }),
-        });
-        const data = await res.json();
-        const results = data.results;
-
-        // Apply results one by one with stagger
-        for (let i = 0; i < rows.length; i++) {
-            await delay(100);
-            applyPrediction(rows[i], results[i].sentiment, results[i].confidence);
+    $("batchBtn").addEventListener("click", async () => {
+        const texts = lines();
+        if (!texts.length) {
+            input.focus();
+            return toast("Add at least one review, one per line");
         }
+        const tooLong = texts.findIndex((t) => t.length > MAX_CHARS);
+        if (tooLong !== -1) return toast(`Line ${tooLong + 1} is over ${fmt(MAX_CHARS)} characters`);
+        try {
+            const results = await withLoading($("batchBtn"), async () => {
+                const out = [];
+                for (let i = 0; i < texts.length; i += BATCH_CHUNK) {
+                    const chunk = texts.slice(i, i + BATCH_CHUNK);
+                    out.push(...(await postJson("/predict_all", { reviews: chunk })).results);
+                }
+                return out;
+            });
+            addItems(texts.map((text, i) => ({ text, result: results[i] })));
+            input.value = "";
+            count();
+            $("batchResults").scrollIntoView({ behavior: "smooth", block: "start" });
+        } catch (err) {
+            toast(err.message);
+        }
+    });
 
-        showToast("✅ All reviews analysed!");
-    } catch (err) {
-        console.error("Predict all error:", err);
-        showToast("❌ Something went wrong. Please try again.");
-    } finally {
-        btn.disabled = false;
-        labelSpan.classList.remove("d-none");
-        spinnerSpan.classList.add("d-none");
-    }
-}
-
-function delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/* -----------------------------------------------------------------------
-   Search
-   ----------------------------------------------------------------------- */
-function initSearch() {
-    const input = document.getElementById("searchInput");
-    input.addEventListener("input", applyFilters);
-}
-
-/* -----------------------------------------------------------------------
-   Filter Dropdown
-   ----------------------------------------------------------------------- */
-function initFilter() {
-    const select = document.getElementById("filterSelect");
-    select.addEventListener("change", applyFilters);
-}
-
-/* -----------------------------------------------------------------------
-   Combined filter logic
-   ----------------------------------------------------------------------- */
-function applyFilters() {
-    const query = document.getElementById("searchInput").value.toLowerCase().trim();
-    const filterValue = document.getElementById("filterSelect").value;
-    const rows = document.querySelectorAll("#reviewTableBody .review-row");
-
-    rows.forEach(row => {
-        const text = row.querySelector(".review-full-text").value.toLowerCase();
-        const sentiment = row.getAttribute("data-sentiment");
-
-        const matchesSearch = !query || text.includes(query);
-        const matchesFilter = filterValue === "all" || sentiment === filterValue;
-
-        row.style.display = (matchesSearch && matchesFilter) ? "" : "none";
+    document.querySelectorAll(".tab").forEach((tab) =>
+        tab.addEventListener("click", () => {
+            state.filter = tab.dataset.filter;
+            document.querySelectorAll(".tab").forEach((t) => t.setAttribute("aria-selected", String(t === tab)));
+            renderList();
+        })
+    );
+    $("batchSearch").addEventListener("input", (e) => {
+        state.query = e.target.value.trim().toLowerCase();
+        renderList();
+    });
+    $("exportBtn").addEventListener("click", exportCsv);
+    $("clearBtn").addEventListener("click", () => {
+        state.items = [];
+        renderBatch();
     });
 }
 
-/* -----------------------------------------------------------------------
-   Toast Notification
-   ----------------------------------------------------------------------- */
-function showToast(message) {
-    const toastEl = document.getElementById("liveToast");
-    const bodyEl = document.getElementById("toastBody");
-    bodyEl.textContent = message;
-    const toast = bootstrap.Toast.getOrCreateInstance(toastEl, { delay: 3000 });
-    toast.show();
+function addItems(entries) {
+    entries.forEach(({ text, result }) => state.items.push({ id: state.nextId++, text, result }));
+    renderBatch();
 }
 
-/* -----------------------------------------------------------------------
-   Add New Review
-   ----------------------------------------------------------------------- */
-function initAddReview() {
-    const btn = document.getElementById("predictNewReviewBtn");
-    btn.addEventListener("click", addNewReview);
+function renderBatch() {
+    const has = state.items.length > 0;
+    $("batchResults").hidden = !has;
+    $("batchEmpty").hidden = has;
+    if (!has) return;
 
-    // Reset modal state when it closes
-    const modal = document.getElementById("addReviewModal");
-    modal.addEventListener("hidden.bs.modal", () => {
-        document.getElementById("newReviewText").value = "";
-        document.getElementById("newReviewError").classList.add("d-none");
-    });
+    const counts = { Positive: 0, Neutral: 0, Negative: 0 };
+    state.items.forEach((item) => counts[item.result.sentiment]++);
+    const total = state.items.length;
 
-    // Clear error when user starts typing
-    document.getElementById("newReviewText").addEventListener("input", () => {
-        document.getElementById("newReviewError").classList.add("d-none");
+    const summary = $("summaryText");
+    summary.replaceChildren(document.createTextNode(`${plural(total, "review")}: `));
+    CLASSES.forEach((c, i) => {
+        summary.append(el("span", c.toLowerCase(), `${Math.round((counts[c] / total) * 100)}% ${c.toLowerCase()}`));
+        summary.append(document.createTextNode(i < CLASSES.length - 1 ? ", " : "."));
     });
+    renderStack($("summaryBar"), counts);
+
+    document.querySelector('[data-count="all"]').textContent = fmt(total);
+    CLASSES.forEach((c) => (document.querySelector(`[data-count="${c}"]`).textContent = fmt(counts[c])));
+    renderList();
 }
 
-async function addNewReview() {
-    const textarea = document.getElementById("newReviewText");
-    const errorEl = document.getElementById("newReviewError");
-    const btn = document.getElementById("predictNewReviewBtn");
-    const labelSpan = btn.querySelector(".btn-label");
-    const spinnerSpan = btn.querySelector(".spinner-border");
-    const reviewText = textarea.value.trim();
-
-    // Validate
-    if (!reviewText) {
-        errorEl.classList.remove("d-none");
-        textarea.focus();
-        return;
-    }
-
-    // Show spinner
-    btn.disabled = true;
-    labelSpan.classList.add("d-none");
-    spinnerSpan.classList.remove("d-none");
-
-    try {
-        const res = await fetch("/predict", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ review: reviewText }),
+function renderList() {
+    const list = $("batchList");
+    list.replaceChildren();
+    const visible = state.items.filter((item) =>
+        (state.filter === "all" || item.result.sentiment === state.filter) &&
+        (!state.query || item.text.toLowerCase().includes(state.query))
+    );
+    visible.forEach((item) => {
+        const li = el("li", "review-item");
+        li.tabIndex = 0;
+        li.append(sentimentTag(item.result.sentiment), el("p", "review-text", item.text),
+                  el("span", "review-conf num", `${Math.round(item.result.confidence)}%`));
+        const open = () => openInAnalyzer(item.text);
+        li.addEventListener("click", open);
+        li.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                open();
+            }
         });
-        const data = await res.json();
+        list.append(li);
+    });
+    $("noMatches").hidden = visible.length > 0;
+}
 
-        // Build new row
-        const id = nextReviewId++;
-        const truncated = reviewText.length > 80 ? reviewText.substring(0, 80) + "…" : reviewText;
-        const sentiment = data.sentiment;
-        const confidence = data.confidence;
+function openInAnalyzer(text) {
+    const input = $("analyzerInput");
+    input.value = text;
+    input.dispatchEvent(new Event("input"));
+    $("analyze").scrollIntoView({ behavior: "smooth", block: "start" });
+    analyze();
+}
 
-        const badgeClass = sentiment === "Positive" ? "badge-positive"
-                         : sentiment === "Negative" ? "badge-negative"
-                         : "badge-neutral";
-        const badgeLabel = sentiment === "Positive" ? "🟢 Positive"
-                         : sentiment === "Negative" ? "🔴 Negative"
-                         : "⚪ Neutral";
-        const fillClass = sentiment === "Positive" ? "fill-positive"
-                        : sentiment === "Negative" ? "fill-negative"
-                        : "fill-neutral";
-
-        const tr = document.createElement("tr");
-        tr.className = "review-row";
-        tr.setAttribute("data-id", id);
-        tr.setAttribute("data-sentiment", sentiment);
-        tr.style.animationDelay = "0ms";
-
-        tr.innerHTML = `
-            <td class="col-num">${id}</td>
-            <td class="col-text">
-                <span class="review-text-truncated" data-bs-toggle="tooltip" data-bs-placement="top" title="${reviewText.replace(/"/g, '&quot;')}">${truncated}</span>
-                <input type="hidden" class="review-full-text" value="${reviewText.replace(/"/g, '&quot;')}">
-            </td>
-            <td class="col-sentiment">
-                <span class="badge ${badgeClass}">${badgeLabel}</span>
-            </td>
-            <td class="col-confidence">
-                <div class="confidence-bar-wrapper">
-                    <div class="confidence-track">
-                        <div class="confidence-fill ${fillClass}" style="width: 0"></div>
-                    </div>
-                    <span class="confidence-pct">${confidence}%</span>
-                </div>
-            </td>
-            <td class="col-action">
-                <button class="btn btn-sm btn-predict btn-done" disabled>✅</button>
-            </td>`;
-
-        // Append to table
-        document.getElementById("reviewTableBody").appendChild(tr);
-
-        // Init tooltip on the new row
-        const tooltipEl = tr.querySelector('[data-bs-toggle="tooltip"]');
-        if (tooltipEl) new bootstrap.Tooltip(tooltipEl);
-
-        // Animate confidence bar
-        requestAnimationFrame(() => {
-            const fill = tr.querySelector(".confidence-fill");
-            if (fill) fill.style.width = confidence + "%";
-        });
-
-        // Update summary cards
-        updateSummaryCards(true);
-
-        // Close modal
-        const modal = bootstrap.Modal.getInstance(document.getElementById("addReviewModal"));
-        modal.hide();
-
-        // Scroll to new row
-        tr.scrollIntoView({ behavior: "smooth", block: "center" });
-
-        // Toast
-        showToast(`✅ Review #${id} added — ${sentiment} (${confidence}%)`);
-
-    } catch (err) {
-        console.error("Add review error:", err);
-        showToast("❌ Something went wrong. Please try again.");
-    } finally {
-        btn.disabled = false;
-        labelSpan.classList.remove("d-none");
-        spinnerSpan.classList.add("d-none");
-    }
+function exportCsv() {
+    const esc = (v) => `"${String(v).replace(/"/g, '""')}"`;
+    const lines = ["review,sentiment,confidence,positive,neutral,negative"];
+    state.items.forEach(({ text, result: r }) =>
+        lines.push([esc(text), r.sentiment, r.confidence, r.probabilities.Positive, r.probabilities.Neutral, r.probabilities.Negative].join(","))
+    );
+    const url = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
+    const a = el("a");
+    a.href = url;
+    a.download = "biterate-results.csv";
+    a.click();
+    URL.revokeObjectURL(url);
 }

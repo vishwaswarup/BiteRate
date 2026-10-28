@@ -1,0 +1,26 @@
+{
+  "macro_f1": 0.733,
+  "accuracy": 0.831,
+  "per_class": {
+    "Positive": {
+      "precision": 0.931,
+      "recall": 0.884,
+      "f1": 0.907,
+      "support": 1247
+    },
+    "Neutral": {
+      "precision": 0.424,
+      "recall": 0.476,
+      "f1": 0.448,
+      "support": 246
+    },
+    "Negative": {
+      "precision": 0.823,
+      "recall": 0.869,
+      "f1": 0.845,
+      "support": 582
+    }
+  },
+  "train_size": 10374,
+  "test_size": 2075
+}

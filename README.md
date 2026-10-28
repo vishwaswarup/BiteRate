@@ -1,94 +1,53 @@
-# Biterate
+# BiteRate
 
-Biterate is a restaurant review sentiment analysis project that leverages natural language processing and machine learning techniques to classify customer reviews as positive or negative. This README provides detailed information about the dataset, preprocessing steps, feature extraction, models trained, sample results, and instructions on how to run the project.
+Restaurant review sentiment analysis: classifies a review as **Positive**, **Neutral** or **Negative**, shows the probability of each class, and highlights the words that drove the prediction. Flask + scikit-learn, with a dashboard UI.
 
-## Dataset Source
+## Data
 
-The dataset used in this project is sourced from Kaggle and contains thousands of restaurant reviews labeled with sentiment polarity (positive or negative). The reviews include textual feedback from customers that serve as input for sentiment classification.
+Two sources are merged by `data.py` (deduplicated, blank rows dropped) into a frozen, stratified 80/20 split in `data/train.csv` and `data/test.csv`:
 
-You can find the original dataset here: [Kaggle Restaurant Reviews Dataset](https://www.kaggle.com/datasets/ahmedabelal/restaurant-reviews)
+| Source | Rows (after cleaning) | Labels |
+|---|---|---|
+| `Restaurant_Reviews.tsv` (Kaggle, short reviews) | ~1,000 | Liked 0/1 → Negative / Positive |
+| `data/zomato_reviews.csv` (Zomato, long reviews) | ~9,300 | 1-2★ Negative, 2.5-3.5★ Neutral, 4-5★ Positive |
 
-## Preprocessing
+Neutral examples come only from the star-rated source. The test set is never used for training when reporting metrics.
 
-The raw text data undergoes several preprocessing steps to prepare it for machine learning modeling:
+## Model
 
-- **Tokenization:** Splitting the reviews into individual words or tokens.
-- **Lemmatization:** Reducing words to their base or dictionary form to normalize variations.
-- **Stopwords Removal:** Eliminating common words that do not contribute to sentiment, such as "the", "and", "is".
-- **Negation Handling:** Identifying negation words and modifying subsequent tokens to better capture sentiment flips (e.g., "not good" treated differently from "good").
+- **Preprocessing** (`preprocessing.py`): contraction expansion (including curly apostrophes), lemmatization, stopword removal that *keeps* negations and intensifiers, negation marking limited to the same clause (`not good` → `not_good`), and emojis as individual tokens.
+- **Features** (`model.py`): TF-IDF word 1-2-grams on the cleaned text + TF-IDF character 2-5-grams on the raw text.
+- **Classifier**: class-balanced multinomial logistic regression (probabilities power the UI).
 
-These preprocessing steps help in cleaning and standardizing the text data for effective feature extraction.
+### Held-out results (2,075 reviews)
 
-## Feature Extraction
+| | Precision | Recall | F1 |
+|---|---|---|---|
+| Negative | 0.82 | 0.87 | 0.85 |
+| Neutral | 0.42 | 0.48 | 0.45 |
+| Positive | 0.93 | 0.88 | 0.91 |
 
-Features are extracted from the preprocessed text using:
+Macro-F1 **0.73**, accuracy **0.83** (0.87 on the short Yelp-style reviews, 0.83 on Zomato). Neutral is the hardest class, as expected for "mixed" reviews and noisy star labels. These numbers are for a model trained on the training split only; the deployed `model.pkl` is refit on all data.
 
-- **TF-IDF Vectorization:** Term Frequency-Inverse Document Frequency is used to weigh words according to their importance across the dataset.
-- **Bigrams:** In addition to single words (unigrams), pairs of consecutive words are included to capture context and phrases relevant to sentiment.
+## Run it
 
-This approach provides a rich representation of the textual data for model training.
+```bash
+pip install -r requirements-train.txt   # training + app (the deployed app only needs requirements.txt)
+python data.py                          # rebuild the split (only if data changes)
+python main.py                          # train, print held-out metrics, write model.pkl + metrics.json
+python app.py                           # http://localhost:5000
+python -m unittest test_preprocessing   # preprocessing tests
+```
 
-## Models Trained
+On macOS, port 5000 may be taken by AirPlay Receiver; change the port in `app.py` if so. Set `FLASK_DEBUG=1` for debug mode.
 
-Several machine learning models have been trained and evaluated on the processed dataset:
+## API
 
-- **Naive Bayes:** A probabilistic classifier well-suited for text classification tasks.
-- **Logistic Regression:** A linear model that estimates the probability of a review being positive or negative.
-- **Random Forest:** An ensemble of decision trees that captures non-linear relationships and interactions among features.
+- `POST /predict` `{"review": "..."}` → `{sentiment, confidence, probabilities, terms}`
+- `POST /predict_all` `{"reviews": ["...", ...]}` (max 100) → `{results: [...]}`
 
-Each model has been tuned and validated using metrics such as accuracy and F1-score to ensure robust performance.
+Input is limited to 5,000 characters per review. If `model.pkl` can't be loaded the API returns 503 rather than guessing.
 
-## Sample Results
+## Deploying
 
-The models demonstrate strong performance in classifying restaurant review sentiments. For example:
-
-- Naive Bayes achieved an accuracy of 85% and an F1-score of 0.84 on the test set.
-- Logistic Regression improved results with an accuracy of 88% and an F1-score of 0.87.
-- Random Forest showed comparable performance with an accuracy of 87% and an F1-score of 0.86.
-
-These results highlight the effectiveness of machine learning techniques in understanding customer sentiment from text data.
-
-## How to Run the Project
-
-To run the Biterate project locally, follow these steps:
-
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/vishwaswarup/BiteRate
-   cd biterate
-   ```
-
-2. **Install dependencies:**
-   Ensure you have Python 3.7+ installed. Then install required packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Download the dataset:**
-   Download the restaurant reviews dataset from Kaggle and place it in the `data/` directory.
-
-4. **Preprocess the data:**
-   Run the preprocessing script to clean and prepare the text data:
-   ```bash
-   python preprocess.py
-   ```
-
-5. **Train models:**
-   Train the desired models using:
-   ```bash
-   python train.py --model naive_bayes
-   python train.py --model logistic_regression
-   python train.py --model random_forest
-   ```
-
-6. **Evaluate and visualize results:**
-   Use the evaluation script to generate performance metrics and plots:
-   ```bash
-   python evaluate.py
-   ```
-
-For detailed usage and parameter options, refer to the respective script docstrings and help commands.
-
----
-
-Thank you for exploring Biterate! Contributions and feedback are welcome.
+`vercel.json` is configured for Vercel. NLTK data is bundled in `nltk_data/`, so nothing is downloaded at runtime. `scikit-learn` is pinned to the version used to train `model.pkl`; retrain if you change it.
