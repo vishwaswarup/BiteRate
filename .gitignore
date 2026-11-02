@@ -9,3 +9,7 @@ env/
 dist/
 build/
 .DS_Store
+
+# Markdown notes stay local; only the README is tracked
+*.md
+!README.md
